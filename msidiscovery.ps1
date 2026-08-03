@@ -397,9 +397,66 @@ begin {
         }
 
         return [PSCustomObject]@{
-            ComAddIns          = @($comAddinGroups.Values)
-            ExcelOpenKeyAddIns = @($excelOpenEntries)
+            HasComAddIns          = (@($comAddinGroups.Values).Count -gt 0)
+            HasExcelOpenKeyAddIns = (@($excelOpenEntries).Count -gt 0)
+            ComAddIns             = @($comAddinGroups.Values)
+            ExcelOpenKeyAddIns    = @($excelOpenEntries)
         }
+    }
+
+    function Get-MsiHkcuRegistryHives {
+        param(
+            [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$RegistryRows,
+            [Parameter(Mandatory = $false)][string]$AllUsersPropertyValue
+        )
+
+        # Root: 0=HKCR, 1=HKCU, 2=HKLM, 3=HKU, -1=HKCU or HKLM depending on ALLUSERS at real install time.
+        # ALLUSERS set (usually "1") means a per-machine install, so -1 resolves to HKLM; otherwise it's
+        # a per-user install and -1 resolves to HKCU. This is the same rule Windows Installer itself uses,
+        # but note ALLUSERS can still be overridden on the real msiexec command line, so treat -1 rows as
+        # "likely" rather than certain.
+        $isPerMachineInstall = -NOT [string]::IsNullOrEmpty($AllUsersPropertyValue)
+
+        $hkcuGroups = [ordered]@{}
+
+        foreach ($row in $RegistryRows) {
+            $isHkcu = $false
+            $rootNote = $null
+
+            if ($row.Root -eq "1") {
+                $isHkcu = $true
+            }
+            elseif ($row.Root -eq "-1" -and -NOT $isPerMachineInstall) {
+                $isHkcu = $true
+                $rootNote = "Root is -1 (HKCU/HKLM depending on ALLUSERS); ALLUSERS is not set in this MSI's Property table, so this resolves to HKCU by default, but can be overridden at install time."
+            }
+
+            if (-NOT $isHkcu) { continue }
+
+            $key = $row.Key
+            if (-NOT $key) { continue }
+
+            if (-NOT $hkcuGroups.Contains($key)) {
+                $hkcuGroups[$key] = [PSCustomObject]@{
+                    RegistryHive = "HKEY_CURRENT_USER"
+                    RegistryKey  = $key
+                    ValueNames   = @()
+                    Components   = @()
+                    Note         = $rootNote
+                }
+            }
+
+            $entry = $hkcuGroups[$key]
+            $valueName = if ($row.Name) { $row.Name } else { "@ (default value)" }
+            if ($entry.ValueNames -notcontains $valueName) {
+                $entry.ValueNames += $valueName
+            }
+            if ($row.Component_ -and ($entry.Components -notcontains $row.Component_)) {
+                $entry.Components += $row.Component_
+            }
+        }
+
+        return @($hkcuGroups.Values)
     }
 
     function Get-MsiDriverInfo {
@@ -536,15 +593,23 @@ process {
                 $directoryLookup[$d.Directory] = @{ Parent = $d.Directory_Parent; DefaultDir = $d.DefaultDir }
             }
 
+            $propertiesTable = Get-MsiPropertiesTable -Database $db
+
             $addInInfo = Get-MsiAddInInfo -RegistryRows $registryRows -ProgIdRows $progIdRows -ClassRows $classRows -FileRows $fileRows -ComponentRows $componentRows
             $driverInfo = Get-MsiDriverInfo -ServiceInstallRows $serviceInstallRows -FileRows $fileRows -OdbcDriverRows $odbcDriverRows
             $fileInventory = Get-MsiFileInventory -FileRows $fileRows -ComponentRows $componentRows -DirectoryLookup $directoryLookup
+            $hkcuHives = @(Get-MsiHkcuRegistryHives -RegistryRows $registryRows -AllUsersPropertyValue $propertiesTable.ALLUSERS)
 
             $report = [PSCustomObject]@{
                 MsiPath      = $resolvedPath
                 SummaryInfo  = Get-MsiSummaryInfo -Database $db
-                Properties   = Get-MsiPropertiesTable -Database $db
+                Properties   = $propertiesTable
                 AddIns       = $addInInfo
+                HkcuRegistry = [PSCustomObject]@{
+                    HasHkcuRegistryEntries = ($hkcuHives.Count -gt 0)
+                    HiveCount              = $hkcuHives.Count
+                    Hives                  = $hkcuHives
+                }
                 Drivers      = $driverInfo
                 Files        = $fileInventory
                 Registry     = @($registryRows)
@@ -566,13 +631,21 @@ process {
             if (-NOT $Quiet) {
                 Write-Output ""
                 Write-Output "Product: $($report.Properties.ProductName) $($report.Properties.ProductVersion) ($($report.Properties.Manufacturer))"
+                Write-Output ""
+                Write-Output "Q: Does this MSI install any Excel 'OPEN'-key add-ins? $(if ($report.AddIns.HasExcelOpenKeyAddIns) { 'YES' } else { 'NO' })"
+                foreach ($a in $report.AddIns.ExcelOpenKeyAddIns) {
+                    Write-Output "  - [$($a.RegistryRoot)] $($a.RegistryKey)\$($a.ValueName) points to: $($a.Value)"
+                }
+                Write-Output ""
+                Write-Output "Q: Does this MSI write any HKEY_CURRENT_USER registry hives? $(if ($report.HkcuRegistry.HasHkcuRegistryEntries) { 'YES' } else { 'NO' }) (hive count: $($report.HkcuRegistry.HiveCount))"
+                foreach ($h in $report.HkcuRegistry.Hives) {
+                    Write-Output "  - HKEY_CURRENT_USER\$($h.RegistryKey)  [values: $($h.ValueNames -join ', ')]"
+                    if ($h.Note) { Write-Output "      NOTE: $($h.Note)" }
+                }
+                Write-Output ""
                 Write-Output "COM add-ins found: $($report.AddIns.ComAddIns.Count)"
                 foreach ($a in $report.AddIns.ComAddIns) {
                     Write-Output "  - [$($a.HostApplication)] $($a.ProgId) LoadBehavior=$($a.LoadBehavior) Binary=$($a.BinaryFile)"
-                }
-                Write-Output "Excel 'OPEN' key add-ins found: $($report.AddIns.ExcelOpenKeyAddIns.Count)"
-                foreach ($a in $report.AddIns.ExcelOpenKeyAddIns) {
-                    Write-Output "  - $($a.RegistryKey)\$($a.ValueName) = $($a.Value)"
                 }
                 Write-Output "Driver services found: $($report.Drivers.DriverServices.Count), .sys files found: $($report.Drivers.DriverSysFiles.Count), ODBC drivers found: $($report.Drivers.OdbcDrivers.Count)"
                 Write-Output "Files: $($report.Files.Count), Registry rows: $($report.Registry.Count), Custom actions: $($report.CustomActions.Count)"
