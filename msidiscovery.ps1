@@ -300,17 +300,89 @@ begin {
         if ($parts.Count -ge 2) { return $parts[1] } else { return $parts[0] }
     }
 
+    # --- Property-driven directory resolution -----------------------------------------------------------
+    #
+    # The Directory table's DefaultDir is only a fallback. Real Windows Installer resolves a directory by
+    # checking FIRST whether a Property exists with the exact same name as the Directory table key - if so,
+    # that Property's (fully formatted) value wins outright. Installers built with Advanced Installer/WiX/
+    # InstallShield routinely compute the true install directory this way via "SetProperty"-style custom
+    # actions (msidbCustomActionTypeTextData, base Type value 3 regardless of the upper source/timing bits -
+    # e.g. WiX's <SetProperty> element always compiles to exactly this), such as:
+    #   SET_APPDIR (Type 307): Source=APPDIR, Target=[ProgramFilesFolder][Manufacturer]\[ProductShortName]
+    #   SET_TARGETDIR_TO_APPDIR (Type 51): Source=TARGETDIR, Target=[APPDIR]
+    # Reproducing this is the difference between reporting the meaningless literal Directory-table default
+    # ("C:\APPDIR\") and the actual folder the app installs into ("C:\Program Files\Vendor\Product\").
+
+    function Resolve-MsiFormattedString {
+        param(
+            [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Value,
+            [Parameter(Mandatory = $true)][hashtable]$Properties
+        )
+
+        if (-NOT $Value) { return $Value }
+
+        $evaluator = {
+            param($m)
+            $propName = $m.Groups[1].Value
+            if ($Properties.ContainsKey($propName) -and $Properties[$propName]) {
+                return $Properties[$propName]
+            }
+            return $m.Value
+        }.GetNewClosure()
+
+        return [regex]::Replace($Value, '\[([A-Za-z_][A-Za-z0-9_\.]*)\]', $evaluator)
+    }
+
+    function Get-MsiResolvedProperties {
+        param(
+            [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$PropertyRows,
+            [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$CustomActionRows
+        )
+
+        $resolved = @{}
+        # Seed with generic special-folder defaults (best-effort local-machine guesses)...
+        # Keep the trailing backslash: standard MSI folder properties always end with one, and formatted
+        # strings like "[ProgramFilesFolder][Manufacturer]\[ProductShortName]" rely on it being there.
+        foreach ($k in $script:SpecialFolders.Keys) { $resolved[$k] = $script:SpecialFolders[$k] }
+        # ...then the MSI's own Property table, which wins over the generic guesses when both exist
+        foreach ($row in $PropertyRows) {
+            if ($row.Property) { $resolved[$row.Property] = $row.Value }
+        }
+
+        # "SetProperty"-style custom actions: Source = property name being set, Target = formatted value.
+        # This is the base Type-3 (TextData) family regardless of the upper source/timing bits, which are
+        # not being decoded here since only the "does this action set a property" fact matters for this.
+        $setPropertyActions = @($CustomActionRows | Where-Object {
+                $t = 0
+                [void][int]::TryParse($_.Type, [ref]$t)
+                (($t -band 0x7) -eq 3) -and $_.Source
+            })
+
+        # Multiple passes resolve chained references (e.g. TARGETDIR=[APPDIR], APPDIR=[ProgramFilesFolder]...)
+        # regardless of what order the custom actions happen to appear in the table.
+        for ($pass = 0; $pass -lt 5; $pass++) {
+            foreach ($ca in $setPropertyActions) {
+                $resolved[$ca.Source] = Resolve-MsiFormattedString -Value $ca.Target -Properties $resolved
+            }
+        }
+
+        return $resolved
+    }
+
     function Resolve-MsiDirectoryPath {
         param(
             [Parameter(Mandatory = $true)][AllowEmptyCollection()][hashtable]$DirectoryLookup,
             [Parameter(Mandatory = $true)][string]$DirectoryKey,
-            [Parameter(Mandatory = $true)][System.Collections.Generic.Dictionary[string, string]]$Cache
+            [Parameter(Mandatory = $true)][System.Collections.Generic.Dictionary[string, string]]$Cache,
+            [Parameter(Mandatory = $true)][hashtable]$ResolvedProperties
         )
 
         if ($Cache.ContainsKey($DirectoryKey)) { return $Cache[$DirectoryKey] }
 
-        if ($script:SpecialFolders.ContainsKey($DirectoryKey)) {
-            $resolved = $script:SpecialFolders[$DirectoryKey]
+        # A Property with the same name as this Directory key overrides the Directory table's default -
+        # only trust it if it fully resolved (no leftover "[...]" token for an unknown/unresolved property).
+        if ($ResolvedProperties.ContainsKey($DirectoryKey) -and $ResolvedProperties[$DirectoryKey] -and ($ResolvedProperties[$DirectoryKey] -notmatch '\[')) {
+            $resolved = $ResolvedProperties[$DirectoryKey].TrimEnd('\') + '\'
             $Cache[$DirectoryKey] = $resolved
             return $resolved
         }
@@ -326,10 +398,11 @@ begin {
         $longName = Get-MsiDefaultDirLongName -DefaultDir $entry.DefaultDir
 
         if (-NOT $entry.Parent -or $entry.Parent -eq $DirectoryKey) {
-            $resolved = "$($script:SpecialFolders['TARGETDIR'])$longName\"
+            $targetRoot = if ($ResolvedProperties.ContainsKey('TARGETDIR')) { $ResolvedProperties['TARGETDIR'].TrimEnd('\') + '\' } else { $script:SpecialFolders['TARGETDIR'] }
+            $resolved = "$targetRoot$longName\"
         }
         else {
-            $parentResolved = Resolve-MsiDirectoryPath -DirectoryLookup $DirectoryLookup -DirectoryKey $entry.Parent -Cache $Cache
+            $parentResolved = Resolve-MsiDirectoryPath -DirectoryLookup $DirectoryLookup -DirectoryKey $entry.Parent -Cache $Cache -ResolvedProperties $ResolvedProperties
             if ($longName -and $longName -ne ".") {
                 $resolved = "$parentResolved$longName\"
             }
@@ -501,7 +574,9 @@ begin {
     function Get-MsiPrintableStrings {
         param(
             [Parameter(Mandatory = $true)][byte[]]$Bytes,
-            [int]$MinLength = 5
+            # 4, not 5: the single most important literal for this whole feature is "OPEN" itself (4 chars) -
+            # compiled code commonly stores it as a standalone constant, concatenated with the key path at runtime.
+            [int]$MinLength = 4
         )
 
         $pattern = "[\x20-\x7E]{$MinLength,}"
@@ -519,15 +594,21 @@ begin {
 
     function Find-MsiAddInHints {
         param(
-            [Parameter(Mandatory = $true)]$Strings
+            [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Strings
         )
 
         $hints = @()
         foreach ($s in $Strings) {
             if ([string]::IsNullOrWhiteSpace($s)) { continue }
 
-            if ($s -match '(?i)Office\\[^\\]*\\?Excel\\Options') {
+            # Compiled code very often stores the "Office\<version>\" prefix and the "\Excel\Options" suffix as
+            # SEPARATE string literals, concatenated at runtime - so the "Office\...\" prefix must be optional here,
+            # not required, or the path-fragment-only case (just "\Excel\Options") is silently missed.
+            if ($s -match '(?i)(Office\\[^\\]*\\)?Excel\\Options\b') {
                 $hints += [PSCustomObject]@{ Category = "ExcelOptionsRegistryPath"; Match = $s }
+            }
+            elseif ($s -match '(?i)(Office\\[^\\]*\\)?Excel\\Add-in Manager\b') {
+                $hints += [PSCustomObject]@{ Category = "ExcelAddInManagerPath"; Match = $s }
             }
             elseif ($s -match '(?i)Office\\(?:[A-Za-z0-9\.]+\\)?Addins\\') {
                 $hints += [PSCustomObject]@{ Category = "ComAddinRegistryPath"; Match = $s }
@@ -555,6 +636,24 @@ begin {
         }
 
         return $hints
+    }
+
+    # Categories specific enough on their own to mean something (an Excel/Office registry path fragment, or a
+    # reference to an actual .xll/.xla/.xlam file). "ExcelOpenValueName" ("OPEN"), "RegistryApiUsage", and
+    # "ScriptRegistryUsage" are common words/API names found in huge numbers of unrelated binaries (dialog
+    # text, fopen/RegOpenKeyEx, etc.) - on their own they're just noise. A binary/action is only worth
+    # surfacing when it has at least one strong hint; weak hints are kept alongside a strong one as context.
+    $StrongAddInHintCategories = @("ExcelOptionsRegistryPath", "ExcelAddInManagerPath", "ComAddinRegistryPath", "ExcelAddInFilePath", "FormattedAddInPath")
+
+    function Get-ConfidentAddInHints {
+        param(
+            [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Hints
+        )
+
+        $hasStrongHint = @($Hints | Where-Object { $StrongAddInHintCategories -contains $_.Category }).Count -gt 0
+        if (-NOT $hasStrongHint) { return @() }
+
+        return @($Hints)
     }
 
     function Get-MsiBinaryNames {
@@ -618,8 +717,8 @@ begin {
             }
 
             $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
-            $strings = Get-MsiPrintableStrings -Bytes $bytes -MinLength 5
-            $hints = @(Find-MsiAddInHints -Strings $strings)
+            $strings = @(Get-MsiPrintableStrings -Bytes $bytes -MinLength 4)
+            $hints = @(Get-ConfidentAddInHints -Hints @(Find-MsiAddInHints -Strings $strings))
 
             $results += [PSCustomObject]@{
                 BinaryName = $name
@@ -648,7 +747,6 @@ begin {
             [void][int]::TryParse($ca.Type, [ref]$type)
 
             $baseType = $type -band 0x7
-            $sourceIsBinary = ($type -band 0x10) -ne 0
             $isDeferred = ($type -band 0x400) -ne 0
             $isCommit = ($type -band 0x200) -ne 0
             $isRollback = ($type -band 0x100) -ne 0
@@ -663,11 +761,15 @@ begin {
             }
             $timing = if ($isRollback) { "Rollback" } elseif ($isCommit) { "Commit" } elseif ($isDeferred) { "Deferred" } else { "Immediate" }
 
-            $targetHints = @(Find-MsiAddInHints -Strings @($ca.Target, $ca.Source))
+            $targetHints = @(Get-ConfidentAddInHints -Hints @(Find-MsiAddInHints -Strings @($ca.Target, $ca.Source)))
 
+            # Link by name match against the Binary table rather than gating strictly on the decoded
+            # "sourceIsBinary" bit: the msidbCustomActionType bit layout is not fully certain from the SDK docs
+            # alone, and a missed link (false negative) is worse than an occasional coincidental name match.
+            # $binaryFinding.Hints is already confidence-filtered by Get-MsiBinaryStreamFindings.
             $binaryFinding = $null
             $binaryHints = @()
-            if ($sourceIsBinary -and $ca.Source -and $binaryFindingsByName.ContainsKey($ca.Source)) {
+            if ($ca.Source -and $binaryFindingsByName.ContainsKey($ca.Source)) {
                 $binaryFinding = $binaryFindingsByName[$ca.Source]
                 $binaryHints = @($binaryFinding.Hints)
             }
@@ -682,7 +784,7 @@ begin {
                 Timing           = $timing
                 Source           = $ca.Source
                 Target           = $ca.Target
-                LinkedBinaryName = if ($sourceIsBinary) { $ca.Source } else { $null }
+                LinkedBinaryName = if ($binaryFinding) { $ca.Source } else { $null }
                 BinaryScanned    = if ($binaryFinding) { $binaryFinding.Scanned } else { $null }
                 BinarySkipReason = if ($binaryFinding) { $binaryFinding.SkipReason } else { $null }
                 Hints            = $allHints
@@ -745,7 +847,8 @@ begin {
         param(
             [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$FileRows,
             [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$ComponentRows,
-            [Parameter(Mandatory = $true)][AllowEmptyCollection()][hashtable]$DirectoryLookup
+            [Parameter(Mandatory = $true)][AllowEmptyCollection()][hashtable]$DirectoryLookup,
+            [Parameter(Mandatory = $true)][hashtable]$ResolvedProperties
         )
 
         $componentByKey = @{}
@@ -760,7 +863,7 @@ begin {
             $resolvedDir = $null
             $component = $componentByKey[$file.Component_]
             if ($component) {
-                $resolvedDir = Resolve-MsiDirectoryPath -DirectoryLookup $DirectoryLookup -DirectoryKey $component.Directory_ -Cache $dirCache
+                $resolvedDir = Resolve-MsiDirectoryPath -DirectoryLookup $DirectoryLookup -DirectoryKey $component.Directory_ -Cache $dirCache -ResolvedProperties $ResolvedProperties
             }
 
             [PSCustomObject]@{
@@ -835,10 +938,12 @@ process {
             }
 
             $propertiesTable = Get-MsiPropertiesTable -Database $db
+            $propertyRows = @($propertiesTable.PSObject.Properties | ForEach-Object { [PSCustomObject]@{ Property = $_.Name; Value = $_.Value } })
+            $resolvedProperties = Get-MsiResolvedProperties -PropertyRows $propertyRows -CustomActionRows $customActionRows
 
             $addInInfo = Get-MsiAddInInfo -RegistryRows $registryRows -ProgIdRows $progIdRows -ClassRows $classRows -FileRows $fileRows -ComponentRows $componentRows
             $driverInfo = Get-MsiDriverInfo -ServiceInstallRows $serviceInstallRows -FileRows $fileRows -OdbcDriverRows $odbcDriverRows
-            $fileInventory = @(Get-MsiFileInventory -FileRows $fileRows -ComponentRows $componentRows -DirectoryLookup $directoryLookup)
+            $fileInventory = @(Get-MsiFileInventory -FileRows $fileRows -ComponentRows $componentRows -DirectoryLookup $directoryLookup -ResolvedProperties $resolvedProperties)
             $hkcuHives = @(Get-MsiHkcuRegistryHives -RegistryRows $registryRows -AllUsersPropertyValue $propertiesTable.ALLUSERS)
 
             $installedAddInFiles = @(Get-MsiInstalledAddInFiles -FileInventory $fileInventory)
