@@ -19,8 +19,21 @@
       - Excel classic add-ins (XLL/XLA/XLAM): registry rows under "...\Office\<Ver>\Excel\Options" with a
         value name of OPEN, OPEN1, OPEN2, etc. The actual value (the load string/path Excel runs at startup)
         is extracted directly, since that is the value that matters for repackaging.
+      - Add-in registration performed outside the declarative Registry table: many installers (WiX/InstallShield
+        custom setups) write the "OPEN" key or the COM Addins keys from a Custom Action instead - a VBScript/
+        JScript or a compiled DLL/EXE stored as an opaque stream in the "Binary" table. Since that code isn't
+        declarative, it can't be resolved to a guaranteed final value; instead every Binary table stream is
+        extracted (via Database.Export, never executed) and scanned for literal strings that indicate Excel/
+        Office add-in registration (registry path fragments, the literal "OPEN"/"OPENn" value name, .xll/.xla/
+        .xlam paths, MSI "[PROPERTY]" formatted-string placeholders). Each CustomAction's Target/Source text is
+        scanned the same way. These are reported as "likely" hints, not confirmed values, and are clearly
+        labeled as such. Installed .xll/.xla/.xlam files are also cross-referenced from the File table as an
+        independent, always-reliable signal that an Excel add-in is present even when its load mechanism can't
+        be statically resolved.
       - Drivers: ServiceInstall rows whose ServiceType flags mark them as a kernel or file-system driver,
         any File table entries with a .sys extension, and the ODBCDriver table when present.
+      - HKEY_CURRENT_USER registry hives: every distinct registry key written under HKCU (including Root=-1
+        rows resolved via the ALLUSERS property), with the value names present but not their data.
       - Full file, registry, component, and directory inventories, with a best-effort (approximate) resolved
         install path for each file.
       - Summary Information stream, Property table, Feature tree, Custom Actions, Shortcuts, Environment,
@@ -28,7 +41,8 @@
         vendor-specific gets silently missed.
 
     Because this only opens the database in read-only mode, it never modifies the MSI, never requires
-    administrator rights, and never executes any installer or custom action code.
+    administrator rights, and never executes any installer or custom action code - including the binary/script
+    streams pulled from the Binary table, which are only extracted to a temp folder and string-scanned, never run.
 .PARAMETER MsiPath
     Path to one or more .msi files to scan. Accepts pipeline input, so it can be combined with Get-ChildItem
     to scan every MSI under a folder.
@@ -37,6 +51,13 @@
     appended before the extension for each additional file.
 .PARAMETER Quiet
     Suppresses the human-readable console summary; the full report object is still returned on the pipeline.
+.PARAMETER SkipBinaryStreamScan
+    Skips extracting and string-scanning the Binary table (custom action scripts/DLLs/EXEs). Use this for a
+    faster pass when you only care about the declarative Registry table, or on MSIs with very large embedded
+    binaries.
+.PARAMETER MaxBinaryStreamScanBytes
+    Per-stream size cap for the Binary table scan; streams larger than this are skipped (and reported as
+    skipped) rather than fully scanned, to keep large embedded payloads from stalling the scan. Default 20MB.
 
 .EXAMPLE
     >Get-MsiDiscoveryReport.ps1 -MsiPath 'C:\NIP_software\MyAddin\Installer_Cfg\MyAddin.msi' -OutputJsonPath 'C:\NIP_software\MyAddin\discovery.json'
@@ -57,7 +78,13 @@ param(
     [string]$OutputJsonPath,
 
     [Parameter(Mandatory = $false)]
-    [switch]$Quiet
+    [switch]$Quiet,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$SkipBinaryStreamScan,
+
+    [Parameter(Mandatory = $false)]
+    [long]$MaxBinaryStreamScanBytes = 20MB
 )
 
 begin {
@@ -459,6 +486,220 @@ begin {
         return @($hkcuGroups.Values)
     }
 
+    # --- Custom action / Binary stream add-in detection ------------------------------------------------
+    #
+    # Registration performed by a Custom Action (a VBScript/JScript or compiled DLL/EXE stored as an opaque
+    # stream in the Binary table) is invisible to the declarative Registry table above. Record.ReadStream()
+    # does not work reliably through PowerShell's late-bound COM interop (it throws DISP_E_BADINDEX in
+    # testing), so Binary streams are instead extracted with Database.Export(), which writes real files to
+    # disk (verified byte-for-byte, e.g. a DLL stream reads back with a correct "MZ" header) - still entirely
+    # read-only against the source MSI. The extracted files are string-scanned like the classic "strings"
+    # utility, then deleted. Because the code itself is never executed, a match only proves the relevant
+    # words/paths are embedded in the binary/script, not the final runtime value - these are reported as
+    # "likely" hints, not confirmed values.
+
+    function Get-MsiPrintableStrings {
+        param(
+            [Parameter(Mandatory = $true)][byte[]]$Bytes,
+            [int]$MinLength = 5
+        )
+
+        $pattern = "[\x20-\x7E]{$MinLength,}"
+        $found = New-Object System.Collections.Generic.HashSet[string]
+
+        $ascii = [System.Text.Encoding]::ASCII.GetString($Bytes)
+        [regex]::Matches($ascii, $pattern) | ForEach-Object { [void]$found.Add($_.Value) }
+
+        # Compiled DLL/EXE custom actions commonly store registry paths as wide (UTF-16LE) string literals
+        $unicode = [System.Text.Encoding]::Unicode.GetString($Bytes)
+        [regex]::Matches($unicode, $pattern) | ForEach-Object { [void]$found.Add($_.Value) }
+
+        return $found
+    }
+
+    function Find-MsiAddInHints {
+        param(
+            [Parameter(Mandatory = $true)]$Strings
+        )
+
+        $hints = @()
+        foreach ($s in $Strings) {
+            if ([string]::IsNullOrWhiteSpace($s)) { continue }
+
+            if ($s -match '(?i)Office\\[^\\]*\\?Excel\\Options') {
+                $hints += [PSCustomObject]@{ Category = "ExcelOptionsRegistryPath"; Match = $s }
+            }
+            elseif ($s -match '(?i)Office\\(?:[A-Za-z0-9\.]+\\)?Addins\\') {
+                $hints += [PSCustomObject]@{ Category = "ComAddinRegistryPath"; Match = $s }
+            }
+
+            if ($s -match '^(?i)OPEN\d*$') {
+                $hints += [PSCustomObject]@{ Category = "ExcelOpenValueName"; Match = $s }
+            }
+
+            if ($s -match '(?i)\.(xll|xla|xlam)("|\\|$)') {
+                $hints += [PSCustomObject]@{ Category = "ExcelAddInFilePath"; Match = $s }
+            }
+
+            if ($s -match '(?i)^Reg(CreateKey|SetValue|OpenKey|DeleteValue|DeleteKey)') {
+                $hints += [PSCustomObject]@{ Category = "RegistryApiUsage"; Match = $s }
+            }
+
+            if ($s -match '(?i)(WScript\.Shell|RegWrite|regedit|reg\.exe\s+add)') {
+                $hints += [PSCustomObject]@{ Category = "ScriptRegistryUsage"; Match = $s }
+            }
+
+            if ($s -match '\[[A-Za-z_][A-Za-z0-9_]*\][^\[\]]*\.(?i:xll|xla|xlam)') {
+                $hints += [PSCustomObject]@{ Category = "FormattedAddInPath"; Match = $s }
+            }
+        }
+
+        return $hints
+    }
+
+    function Get-MsiBinaryNames {
+        param([Parameter(Mandatory = $true)]$Database)
+
+        if (-NOT (Test-MsiTableExists -Database $Database -TableName "Binary")) {
+            return @()
+        }
+
+        $view = $Database.OpenView("SELECT ``Name`` FROM ``Binary``")
+        [void]$view.Execute()
+
+        $names = @()
+        while ($true) {
+            $record = $view.Fetch()
+            if (-NOT $record) { break }
+            $names += $record.StringData(1)
+            [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($record)
+        }
+
+        [void]$view.Close()
+        [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($view)
+        return $names
+    }
+
+    function Get-MsiBinaryStreamFindings {
+        param(
+            [Parameter(Mandatory = $true)]$Database,
+            [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$BinaryNames,
+            [Parameter(Mandatory = $true)][string]$ExportFolder,
+            [Parameter(Mandatory = $true)][long]$MaxBytes
+        )
+
+        if ($BinaryNames.Count -eq 0) { return @() }
+
+        try {
+            New-Item -ItemType Directory -Path $ExportFolder -Force | Out-Null
+            [void]$Database.Export("Binary", $ExportFolder, "Binary.idt")
+        }
+        catch {
+            Write-Warning "Could not export Binary table streams for scanning: $_"
+            return @()
+        }
+
+        $binarySubfolder = Join-Path $ExportFolder "Binary"
+        if (-NOT (Test-Path -Path $binarySubfolder)) { return @() }
+
+        $results = @()
+        foreach ($file in Get-ChildItem -Path $binarySubfolder -File) {
+            $name = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+
+            if ($file.Length -gt $MaxBytes) {
+                $results += [PSCustomObject]@{
+                    BinaryName = $name
+                    SizeBytes  = $file.Length
+                    Scanned    = $false
+                    SkipReason = "Stream exceeds MaxBinaryStreamScanBytes ($MaxBytes bytes); skipped for performance. Re-run with a higher -MaxBinaryStreamScanBytes to include it."
+                    Hints      = @()
+                }
+                continue
+            }
+
+            $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+            $strings = Get-MsiPrintableStrings -Bytes $bytes -MinLength 5
+            $hints = @(Find-MsiAddInHints -Strings $strings)
+
+            $results += [PSCustomObject]@{
+                BinaryName = $name
+                SizeBytes  = $file.Length
+                Scanned    = $true
+                SkipReason = $null
+                Hints      = $hints
+            }
+        }
+
+        return $results
+    }
+
+    function Get-MsiCustomActionFindings {
+        param(
+            [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$CustomActionRows,
+            [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$BinaryStreamFindings
+        )
+
+        $binaryFindingsByName = @{}
+        foreach ($bf in $BinaryStreamFindings) { $binaryFindingsByName[$bf.BinaryName] = $bf }
+
+        $results = @()
+        foreach ($ca in $CustomActionRows) {
+            $type = 0
+            [void][int]::TryParse($ca.Type, [ref]$type)
+
+            $baseType = $type -band 0x7
+            $sourceIsBinary = ($type -band 0x10) -ne 0
+            $isDeferred = ($type -band 0x400) -ne 0
+            $isCommit = ($type -band 0x200) -ne 0
+            $isRollback = ($type -band 0x100) -ne 0
+
+            $typeLabel = switch ($baseType) {
+                1 { "DLL" }
+                2 { "EXE" }
+                3 { "TextData/Property" }
+                5 { "JScript" }
+                6 { "VBScript" }
+                default { "Type $baseType" }
+            }
+            $timing = if ($isRollback) { "Rollback" } elseif ($isCommit) { "Commit" } elseif ($isDeferred) { "Deferred" } else { "Immediate" }
+
+            $targetHints = @(Find-MsiAddInHints -Strings @($ca.Target, $ca.Source))
+
+            $binaryFinding = $null
+            $binaryHints = @()
+            if ($sourceIsBinary -and $ca.Source -and $binaryFindingsByName.ContainsKey($ca.Source)) {
+                $binaryFinding = $binaryFindingsByName[$ca.Source]
+                $binaryHints = @($binaryFinding.Hints)
+            }
+
+            $allHints = @($targetHints + $binaryHints)
+            if ($allHints.Count -eq 0) { continue }
+
+            $results += [PSCustomObject]@{
+                Action           = $ca.Action
+                Type             = $ca.Type
+                TypeLabel        = $typeLabel
+                Timing           = $timing
+                Source           = $ca.Source
+                Target           = $ca.Target
+                LinkedBinaryName = if ($sourceIsBinary) { $ca.Source } else { $null }
+                BinaryScanned    = if ($binaryFinding) { $binaryFinding.Scanned } else { $null }
+                BinarySkipReason = if ($binaryFinding) { $binaryFinding.SkipReason } else { $null }
+                Hints            = $allHints
+            }
+        }
+
+        return $results
+    }
+
+    function Get-MsiInstalledAddInFiles {
+        param(
+            [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$FileInventory
+        )
+
+        return @($FileInventory | Where-Object { $_.FileName -match '(?i)\.(xll|xla|xlam)$' })
+    }
+
     function Get-MsiDriverInfo {
         param(
             [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$ServiceInstallRows,
@@ -597,8 +838,34 @@ process {
 
             $addInInfo = Get-MsiAddInInfo -RegistryRows $registryRows -ProgIdRows $progIdRows -ClassRows $classRows -FileRows $fileRows -ComponentRows $componentRows
             $driverInfo = Get-MsiDriverInfo -ServiceInstallRows $serviceInstallRows -FileRows $fileRows -OdbcDriverRows $odbcDriverRows
-            $fileInventory = Get-MsiFileInventory -FileRows $fileRows -ComponentRows $componentRows -DirectoryLookup $directoryLookup
+            $fileInventory = @(Get-MsiFileInventory -FileRows $fileRows -ComponentRows $componentRows -DirectoryLookup $directoryLookup)
             $hkcuHives = @(Get-MsiHkcuRegistryHives -RegistryRows $registryRows -AllUsersPropertyValue $propertiesTable.ALLUSERS)
+
+            $installedAddInFiles = @(Get-MsiInstalledAddInFiles -FileInventory $fileInventory)
+
+            $binaryStreamFindings = @()
+            if (-NOT $SkipBinaryStreamScan) {
+                $binaryNames = @(Get-MsiBinaryNames -Database $db)
+                if ($binaryNames.Count -gt 0) {
+                    $exportFolder = Join-Path ([System.IO.Path]::GetTempPath()) "msi-discovery-$([guid]::NewGuid())"
+                    try {
+                        $binaryStreamFindings = @(Get-MsiBinaryStreamFindings -Database $db -BinaryNames $binaryNames -ExportFolder $exportFolder -MaxBytes $MaxBinaryStreamScanBytes)
+                    }
+                    finally {
+                        if (Test-Path -Path $exportFolder) {
+                            Remove-Item -Path $exportFolder -Recurse -Force -ErrorAction SilentlyContinue
+                        }
+                    }
+                }
+            }
+            $customActionFindings = @(Get-MsiCustomActionFindings -CustomActionRows $customActionRows -BinaryStreamFindings $binaryStreamFindings)
+
+            $addInInfo | Add-Member -NotePropertyName InstalledAddInFiles -NotePropertyValue $installedAddInFiles -Force
+            $addInInfo | Add-Member -NotePropertyName HasInstalledAddInFiles -NotePropertyValue ($installedAddInFiles.Count -gt 0) -Force
+            $addInInfo | Add-Member -NotePropertyName CustomActionFindings -NotePropertyValue $customActionFindings -Force
+            $addInInfo | Add-Member -NotePropertyName HasCustomActionAddInHints -NotePropertyValue ($customActionFindings.Count -gt 0) -Force
+            $addInInfo | Add-Member -NotePropertyName BinaryStreamScanSkipped -NotePropertyValue ([bool]$SkipBinaryStreamScan) -Force
+            $addInInfo | Add-Member -NotePropertyName BinaryStreamFindings -NotePropertyValue $binaryStreamFindings -Force
 
             $report = [PSCustomObject]@{
                 MsiPath      = $resolvedPath
@@ -632,9 +899,34 @@ process {
                 Write-Output ""
                 Write-Output "Product: $($report.Properties.ProductName) $($report.Properties.ProductVersion) ($($report.Properties.Manufacturer))"
                 Write-Output ""
-                Write-Output "Q: Does this MSI install any Excel 'OPEN'-key add-ins? $(if ($report.AddIns.HasExcelOpenKeyAddIns) { 'YES' } else { 'NO' })"
+                $hasHintEvidence = $report.AddIns.HasCustomActionAddInHints -or $report.AddIns.HasInstalledAddInFiles
+                $excelAnswer = if ($report.AddIns.HasExcelOpenKeyAddIns) {
+                    "YES (confirmed - declarative Registry table entry found, see values below)"
+                }
+                elseif ($hasHintEvidence) {
+                    "LIKELY (no declarative Registry table entry, but a custom action / binary stream / installed .xll-.xla-.xlam file was found - see CustomActionFindings/InstalledAddInFiles below; the value can't be read statically because it's set by code, not the Registry table)"
+                }
+                else {
+                    "NO (no evidence in the Registry table, custom actions, binary streams, or installed files)"
+                }
+                Write-Output "Q: Does this MSI install any Excel 'OPEN'-key add-ins? $excelAnswer"
                 foreach ($a in $report.AddIns.ExcelOpenKeyAddIns) {
                     Write-Output "  - [$($a.RegistryRoot)] $($a.RegistryKey)\$($a.ValueName) points to: $($a.Value)"
+                }
+                foreach ($f in $report.AddIns.InstalledAddInFiles) {
+                    Write-Output "  - Installed add-in file: $($f.FileName) -> $($f.ApproximateFullPath)"
+                }
+                foreach ($ca in $report.AddIns.CustomActionFindings) {
+                    Write-Output "  - CustomAction '$($ca.Action)' [$($ca.TypeLabel), $($ca.Timing)] Source=$($ca.Source) Target=$($ca.Target)"
+                    foreach ($h in $ca.Hints) {
+                        Write-Output "      HINT [$($h.Category)]: $($h.Match)"
+                    }
+                    if ($ca.LinkedBinaryName -and $ca.BinaryScanned -eq $false) {
+                        Write-Output "      NOTE: linked binary '$($ca.LinkedBinaryName)' was not scanned: $($ca.BinarySkipReason)"
+                    }
+                }
+                if ($SkipBinaryStreamScan) {
+                    Write-Output "  (Binary stream scan was skipped via -SkipBinaryStreamScan)"
                 }
                 Write-Output ""
                 Write-Output "Q: Does this MSI write any HKEY_CURRENT_USER registry hives? $(if ($report.HkcuRegistry.HasHkcuRegistryEntries) { 'YES' } else { 'NO' }) (hive count: $($report.HkcuRegistry.HiveCount))"
